@@ -1,0 +1,670 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>LCC ThreeJS XR Demo</title>
+    </head>
+    <style>
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            overflow: hidden;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        #name-overlay {
+            position: fixed;
+            inset: 0;
+            background: #0b0b0b;
+            color: #eee;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            font-family: sans-serif;
+            gap: 14px;
+            z-index: 10;
+        }
+
+        #name-overlay input {
+            font-size: 18px;
+            padding: 10px 14px;
+            border-radius: 6px;
+            border: 1px solid #444;
+            width: 260px;
+        }
+
+        #name-overlay button {
+            font-size: 16px;
+            padding: 10px 20px;
+            border-radius: 6px;
+            border: none;
+            background: #3388ff;
+            color: white;
+            cursor: pointer;
+        }
+
+        #name-overlay button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+
+        /* Real HTML input used by Meta Quest's system keyboard.
+           It must remain in the DOM and must NOT use display:none. */
+        #quest-tag-input {
+            position: fixed;
+            left: 8px;
+            bottom: 8px;
+            width: 220px;
+            height: 34px;
+            padding: 6px 10px;
+            box-sizing: border-box;
+            opacity: 0.02;
+            z-index: 5;
+            border: 0;
+            outline: none;
+            background: rgba(0,0,0,0.01);
+            color: transparent;
+            caret-color: transparent;
+            pointer-events: none;
+        }
+
+        #tag-status {
+            position: fixed;
+            left: 50%;
+            bottom: 24px;
+            transform: translateX(-50%);
+            padding: 8px 14px;
+            border-radius: 999px;
+            background: rgba(0,0,0,0.65);
+            color: #fff;
+            font: 14px sans-serif;
+            z-index: 6;
+            display: none;
+            pointer-events: none;
+        }
+    </style>
+
+    <body>
+        <!-- Asked before anything else loads: EHS tags need to know who left
+             each note. A normal HTML input also means the Quest's OS keyboard
+             pops up (not our in-VR one), which is much less painful to type on. -->
+        <div id="name-overlay">
+            <div>Ingresá tu nombre para comenzar</div>
+            <input id="name-input" type="text" placeholder="Nombre y apellido" maxlength="40" autofocus />
+            <button id="name-submit" disabled>Continuar</button>
+        </div>
+
+        <!--
+            Meta Quest System Keyboard input.
+            This is intentionally a real DOM input and is kept in the DOM.
+            It is NOT the old Three.js/VRKeyboard mesh.
+        -->
+        <input
+            id="quest-tag-input"
+            type="text"
+            maxlength="120"
+            autocomplete="off"
+            autocorrect="off"
+            autocapitalize="sentences"
+            spellcheck="false"
+            enterkeyhint="done"
+            aria-label="Texto del tag"
+        />
+        <div id="tag-status"></div>
+
+        <script type="importmap">
+            {
+                "imports": {
+                    "three": "./engine/three/three.module.js",
+                    "three/addons/": "./engine/three/jsm/"
+                }
+            }
+        </script>
+        <script type="module">
+            import * as THREE from 'three';
+            import { VRButton } from 'three/addons/webxr/VRButton.js';
+            import { LCCRender } from './sdk/lcc-sdk-three.js';
+            import { XRLocomotion } from './engine/three/XRLocomotion.js';
+            import { MultiplayerSession } from './engine/three/Multiplayer.js';
+
+            // ==================== Configuration ====================
+
+            /** Set to true to show FPS / performance stats overlay and VR HUD */
+            const ENABLE_STATS = true;
+
+            // Fill this in once the server from /server is deployed, e.g.
+            // 'wss://your-app.onrender.com'. Multiplayer/tags stay disabled until set.
+            const MULTIPLAYER_SERVER_URL = 'wss://vr-chilq.onrender.com';
+            const MULTIPLAYER_ROOM = 'edificio-baron';
+
+            // ==================== Name gate ====================
+            // Everything else waits for this so createTag() always has a real
+            // author name instead of an anonymous UUID.
+            const nameOverlay = document.getElementById('name-overlay');
+            const nameInput = document.getElementById('name-input');
+            const nameSubmit = document.getElementById('name-submit');
+
+            nameInput.addEventListener('input', () => {
+                nameSubmit.disabled = nameInput.value.trim().length === 0;
+            });
+            nameInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && nameInput.value.trim().length > 0) nameSubmit.click();
+            });
+
+            const playerName = await new Promise((resolve) => {
+                nameSubmit.addEventListener('click', () => {
+                    const value = nameInput.value.trim();
+                    if (!value) return;
+                    nameOverlay.remove();
+                    resolve(value);
+                });
+            });
+
+            // ==================== Init ====================
+
+            let isVRDevice = false;
+            try {
+                if (navigator.xr) {
+                    isVRDevice = await navigator.xr.isSessionSupported('immersive-vr');
+                }
+            } catch (e) {
+                console.warn('[XR] VR support check failed:', e);
+            }
+            console.warn('isVRDevice: ', isVRDevice);
+
+            // Extract data path from URL ?data=xxx, fallback to default path
+            const dataParam = new URLSearchParams(location.search).get('data');
+            // Relative to this HTML file's own location — NOT location.origin, which
+            // on GitHub Pages project sites is just https://user.github.io without
+            // the /repo-name/ subpath, causing a 404 one level too high.
+            const dataPath = dataParam || new URL('assets/pinatas/lcc2-result/Pinatas.lcc2', document.baseURI).href;
+
+            const scene = new THREE.Scene();
+
+            const renderer = new THREE.WebGLRenderer();
+            // NOTE: do NOT set logarithmicDepthBuffer: true here. This SDK's splats
+            // render through custom shaders (see the LCC_DEPTH define toggled via
+            // setLccDepth) that most likely don't include three.js's log-depth shader
+            // chunks — enabling it mismatches the depth math and can render as a
+            // black screen. If depth-precision flicker comes back, address it via
+            // near/far range instead, not this flag.
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+
+            if (isVRDevice) {
+                renderer.xr.enabled = true;
+                renderer.xr.setReferenceSpaceType('local-floor');
+                renderer.xr.setFoveation(1);
+                renderer.xr.setFramebufferScaleFactor(0.6);
+            }
+
+            renderer.setClearColor(0x000000);
+            document.body.appendChild(renderer.domElement);
+            if (isVRDevice) {
+                document.body.appendChild(VRButton.createButton(renderer));
+            }
+
+            const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 150000);
+            camera.position.set(0, 2, 0);
+
+            // ==================== XR Locomotion ====================
+            // AVP: pinch select to move continuously along gaze direction
+            // For Quest/Pico thumbstick mode, change device to 'quest' or 'pico'
+            let locomotion = null;
+            if (isVRDevice) {
+                locomotion = new XRLocomotion(renderer, camera, scene, {
+                    device: 'quest',
+                    moveSpeed: 2,
+                    teleport: false,
+                    fixedHeight: true
+                });
+            } else {
+                // Non-VR: camera added directly to scene
+                scene.add(camera);
+            }
+            // ==================== End Locomotion ====================
+
+            // lccObj is assigned further down (after LCCRender.load), but the
+            // controller listeners below need to call lccObj.raycastFromOrigin —
+            // declared early so the closures can see it once it's ready.
+            let lccObj = null;
+
+            // ==================== Multiplayer + EHS Tags ====================
+            let controllerL = null;
+            let controllerR = null;
+            let multiplayer = null;
+
+            // Native Meta Quest System Keyboard:
+            // we use a real DOM <input>, not a Three.js keyboard mesh.
+            const tagInput = document.getElementById('quest-tag-input');
+            const tagStatus = document.getElementById('tag-status');
+
+            let tagInputActive = false;
+            let tagPosition = null;
+            let tagAimController = null;
+            let activeInputController = null;
+            let tagCommitted = false;
+            let xrSession = null;
+
+            // Precision raycast parameters.
+            const TAG_RAYCAST_MAX_DISTANCE = 50;
+            const TAG_RAYCAST_RADIUS = 0.03;
+            const TAG_RAYCAST_OPACITY_THRESHOLD = 0.3;
+            const TAG_FALLBACK_DISTANCE = 1.5;
+
+            // ---------- Visual tag reticle ----------
+            // A small ring + center dot. The reticle follows the controller ray
+            // and is locked at the selected XYZ while the Quest keyboard is open.
+            const reticleGroup = new THREE.Group();
+            reticleGroup.visible = false;
+
+            const reticleOuter = new THREE.Mesh(
+                new THREE.RingGeometry(0.035, 0.055, 32),
+                new THREE.MeshBasicMaterial({
+                    color: 0x00ff88,
+                    side: THREE.DoubleSide,
+                    transparent: true,
+                    opacity: 0.95,
+                    depthTest: false,
+                    depthWrite: false
+                })
+            );
+
+            const reticleCenter = new THREE.Mesh(
+                new THREE.SphereGeometry(0.012, 12, 12),
+                new THREE.MeshBasicMaterial({
+                    color: 0xffffff,
+                    transparent: true,
+                    opacity: 1,
+                    depthTest: false,
+                    depthWrite: false
+                })
+            );
+
+            reticleGroup.add(reticleOuter);
+            reticleGroup.add(reticleCenter);
+            reticleGroup.renderOrder = 999;
+            scene.add(reticleGroup);
+
+            const controllerOrigin = new THREE.Vector3();
+            const controllerDir = new THREE.Vector3();
+            const _rotMat = new THREE.Matrix4();
+
+            const readControllerRay = (controller) => {
+                controllerOrigin.setFromMatrixPosition(controller.matrixWorld);
+                controllerDir
+                    .set(0, 0, -1)
+                    .applyMatrix4(_rotMat.extractRotation(controller.matrixWorld))
+                    .normalize();
+            };
+
+            const setStatus = (message, visible = true) => {
+                tagStatus.textContent = message;
+                tagStatus.style.display = visible ? 'block' : 'none';
+            };
+
+            const positionReticle = (position, preciseHit) => {
+                reticleGroup.position.copy(position);
+                reticleGroup.visible = true;
+
+                const size = preciseHit ? 1 : 1.25;
+                reticleOuter.scale.setScalar(size);
+                reticleCenter.scale.setScalar(size);
+
+                reticleOuter.material.color.setHex(preciseHit ? 0x00ff88 : 0xffb000);
+            };
+
+            const hideReticle = () => {
+                reticleGroup.visible = false;
+            };
+
+            const raycastTagPoint = (controller) => {
+                if (!lccObj || !controller) return null;
+
+                readControllerRay(controller);
+
+                const hit = lccObj.raycastFromOrigin({
+                    origin: {
+                        x: controllerOrigin.x,
+                        y: controllerOrigin.y,
+                        z: controllerOrigin.z
+                    },
+                    direction: {
+                        x: controllerDir.x,
+                        y: controllerDir.y,
+                        z: controllerDir.z
+                    },
+                    maxDistance: TAG_RAYCAST_MAX_DISTANCE,
+                    radius: TAG_RAYCAST_RADIUS,
+                    opacityThreshold: TAG_RAYCAST_OPACITY_THRESHOLD
+                });
+
+                if (hit) {
+                    return {
+                        position: new THREE.Vector3(hit.x, hit.y, hit.z),
+                        precise: true
+                    };
+                }
+
+                return {
+                    position: controllerOrigin.clone().addScaledVector(
+                        controllerDir,
+                        TAG_FALLBACK_DISTANCE
+                    ),
+                    precise: false
+                };
+            };
+
+            // Choose the last controller that generated an interaction.
+            // This keeps the reticle usable without depending on handedness.
+            const markAimController = (controller) => {
+                if (!tagInputActive) tagAimController = controller;
+            };
+
+            const assignHand = (controller) => (event) => {
+                if (event.data.handedness === 'left') controllerL = controller;
+                else if (event.data.handedness === 'right') controllerR = controller;
+            };
+
+            const finishTagInput = (reason = 'dismissed') => {
+                if (!tagInputActive) return;
+
+                const text = tagInput.value.trim();
+                const position = tagPosition ? tagPosition.clone() : null;
+
+                tagInputActive = false;
+                activeInputController = null;
+                tagAimController = null;
+                tagCommitted = true;
+
+                // Remove focus only once. Do not immediately call focus() again:
+                // doing that can cause the Quest keyboard to appear stuck.
+                if (document.activeElement === tagInput) {
+                    tagInput.blur();
+                }
+
+                if (position && text.length > 0 && multiplayer) {
+                    console.log('[Tags] creating tag:', {
+                        text,
+                        position: {
+                            x: position.x,
+                            y: position.y,
+                            z: position.z
+                        },
+                        reason
+                    });
+                    multiplayer.createTag(position, text);
+                    setStatus('Tag creado', true);
+                    setTimeout(() => setStatus('', false), 1200);
+                } else {
+                    console.log('[Tags] input cancelled or empty:', reason);
+                    setStatus('', false);
+                }
+
+                tagPosition = null;
+                hideReticle();
+
+                // Let the next animation frame restore locomotion.
+                setTimeout(() => {
+                    tagCommitted = false;
+                }, 0);
+            };
+
+            // Meta's WebXR System Keyboard does not expose explicit keyboard
+            // key events to the XR app. Text is read from input.value.
+            tagInput.addEventListener('input', () => {
+                if (tagInputActive) {
+                    console.log('[Tags] text:', tagInput.value);
+                }
+            });
+
+            // Done / dismiss / clicking outside the system keyboard ultimately
+            // blurs the DOM input. We treat non-empty text as submit and empty
+            // text as cancel. This is the reliable WebXR Browser path.
+            tagInput.addEventListener('blur', () => {
+                if (tagInputActive) {
+                    finishTagInput('input-blur');
+                }
+            });
+
+            // Keep the input available during the XR session.
+            renderer.xr.addEventListener('sessionstart', () => {
+                xrSession = renderer.xr.getSession();
+
+                if (xrSession) {
+                    if ('isSystemKeyboardSupported' in xrSession) {
+                        console.log(
+                            '[XR] System Keyboard supported:',
+                            xrSession.isSystemKeyboardSupported
+                        );
+                    } else {
+                        console.warn('[XR] Browser does not expose isSystemKeyboardSupported.');
+                    }
+
+                    xrSession.addEventListener('visibilitychange', (event) => {
+                        console.log('[XR] visibility:', event.session.visibilityState);
+                    });
+
+                    xrSession.addEventListener('end', () => {
+                        if (tagInputActive) {
+                            tagInput.value = '';
+                            tagInputActive = false;
+                            activeInputController = null;
+                            tagAimController = null;
+                            tagPosition = null;
+                            hideReticle();
+                        }
+                        xrSession = null;
+                    });
+                }
+            });
+
+            if (isVRDevice) {
+                const c0 = renderer.xr.getController(0);
+                const c1 = renderer.xr.getController(1);
+
+                c0.addEventListener('connected', assignHand(c0));
+                c1.addEventListener('connected', assignHand(c1));
+
+                // Start with one controller as the live aiming reference so a
+                // visible reticle is available before the first tag is created.
+                // If the user uses the other hand, its first trigger/grip switches
+                // the reticle to that controller.
+                tagAimController = c1;
+
+                if (MULTIPLAYER_SERVER_URL) {
+                    multiplayer = new MultiplayerSession(scene, {
+                        serverUrl: MULTIPLAYER_SERVER_URL,
+                        room: MULTIPLAYER_ROOM,
+                        playerName
+                    });
+                    multiplayer.connect();
+                } else {
+                    console.warn(
+                        '[Multiplayer] MULTIPLAYER_SERVER_URL is empty — multiplayer/tags disabled.'
+                    );
+                }
+
+                // Grip opens the native Quest keyboard.
+                // Whichever hand grips first becomes the active input controller.
+                const openTagInput = (controller) => () => {
+                    markAimController(controller);
+
+                    if (tagInputActive) return;
+
+                    if (!multiplayer) {
+                        console.warn('[Tags] Multiplayer server is not configured.');
+                        return;
+                    }
+
+                    if (!lccObj) {
+                        console.warn('[Tags] model not loaded yet.');
+                        return;
+                    }
+
+                    const result = raycastTagPoint(controller);
+                    if (!result) return;
+
+                    // Freeze the exact XYZ chosen by the user before opening
+                    // the system keyboard. The point cannot drift while typing.
+                    tagPosition = result.position.clone();
+                    activeInputController = controller;
+                    tagAimController = controller;
+                    tagInputActive = true;
+                    tagCommitted = false;
+
+                    positionReticle(tagPosition, result.precise);
+
+                    setStatus(
+                        result.precise
+                            ? 'Punto de tag seleccionado'
+                            : 'Sin superficie: usando 1,5 m',
+                        true
+                    );
+
+                    setTimeout(() => {
+                        if (tagInputActive) setStatus('Escribe el tag…', true);
+                    }, 1000);
+
+                    // New editing session: clear the previous value before focus.
+                    tagInput.value = '';
+                    tagInput.focus();
+                };
+
+                c0.addEventListener('squeezestart', openTagInput(c0));
+                c1.addEventListener('squeezestart', openTagInput(c1));
+
+                // Secondary select is intentionally NOT used to type keyboard
+                // keys anymore. The Quest system keyboard handles text input.
+                c0.addEventListener('selectstart', () => markAimController(c0));
+                c1.addEventListener('selectstart', () => markAimController(c1));
+
+                // Keep a controller ray as the live aiming reference when not typing.
+                // Once grip is pressed, the reticle is frozen at tagPosition.
+                window.addEventListener('beforeunload', () => {
+                    if (xrSession) {
+                        try { xrSession.end(); } catch (_) {}
+                    }
+                });
+            }
+            // ==================== End Multiplayer + EHS Tags ====================
+
+            // ==================== Stats Panel ====================
+            let statsPanel = null;
+            if (ENABLE_STATS) {
+                const { StatsPanel } = await import('./engine/three/StatsPanel.js');
+                statsPanel = new StatsPanel(THREE, renderer, { xrHud: isVRDevice });
+                if (statsPanel.xrHudObject) {
+                    scene.add(statsPanel.xrHudObject);
+                }
+            }
+            // ==================== End Stats ====================
+
+            // Use the model matrix to change the model coordinate system
+            const modelMatrix = new THREE.Matrix4(-1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1);
+
+            // Loading lcc object
+            lccObj = LCCRender.load(
+                {
+                    camera: camera,
+                    scene: scene,
+                    dataPath: dataPath,
+                    renderLib: THREE,
+                    canvas: renderer.domElement,
+                    renderer: renderer,
+                    useEnv: true,
+                    usePage: true,
+                    useIndexDB: true,
+                    useLoadingEffect: true,
+                    modelMatrix: modelMatrix,
+                    appKey: null
+                },
+                (mesh) => {
+                    console.log('Lcc object Loaded:  ', mesh);
+                },
+                (percent) => {
+                    console.log('Lcc object loading: ' + (percent * 100).toFixed(1) + '%');
+                },
+                () => {
+                    console.log('Lcc object loading failure');
+                }
+            );
+
+            // Configure performance parameters
+            // Reverted to the exact config that was confirmed working at 56fps.
+            // setLodAutoLevelUp(true) and the raised ceilings (600k/250k/75) are OUT
+            // for now — that's the untested change that lines up with the black
+            // screen. Once this baseline is confirmed working again, reintroduce
+            // ONE change at a time (starting with setLodAutoLevelUp alone) so we
+            // actually know which one is responsible instead of guessing.
+            lccObj.setStartLod(1);
+            lccObj.setMaxSplats(300000);
+            lccObj.setMaxNodeSplats(150000);
+            lccObj.setMaxDistance(60);
+
+            window.lccObj = lccObj;
+            window.LCCRender = LCCRender;
+            window.locomotion = locomotion; // debug: locomotion.getRig().position.set(x,y,z)
+
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+
+            let lastReticleUpdate = 0;
+
+            function animate() {
+                renderer.setAnimationLoop((time, frame) => {
+                    // Pause locomotion while the native Quest keyboard has focus.
+                    if (locomotion && !tagInputActive) {
+                        locomotion.update(time, frame);
+                    }
+
+                    if (multiplayer && controllerL && controllerR) {
+                        multiplayer.update(camera, controllerL, controllerR);
+                    }
+
+                    // Live aiming reference. Throttled so the LCC splat raycast
+                    // does not run every render frame.
+                    if (
+                        isVRDevice &&
+                        !tagInputActive &&
+                        tagAimController &&
+                        lccObj &&
+                        time - lastReticleUpdate > 70
+                    ) {
+                        lastReticleUpdate = time;
+
+                        const result = raycastTagPoint(tagAimController);
+                        if (result) {
+                            positionReticle(result.position, result.precise);
+                        }
+                    }
+
+                    // Hide the live reticle when there is no controller selected
+                    // for aiming. It will reappear on the next controller input.
+                    if (isVRDevice && !tagInputActive && !tagAimController) {
+                        hideReticle();
+                    }
+
+                    LCCRender.update();
+                    renderer.render(scene, camera);
+
+                    if (statsPanel) {
+                        statsPanel.update();
+                    }
+                });
+            }
+
+            animate();
+        </script>
+    </body>
+</html>
