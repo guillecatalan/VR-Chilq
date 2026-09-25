@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>LCC ThreeJS XR Demo</title>
+    </head>
+    <style>
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            overflow: hidden;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        #name-overlay {
+            position: fixed;
+            inset: 0;
+            background: #0b0b0b;
+            color: #eee;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            font-family: sans-serif;
+            gap: 14px;
+            z-index: 10;
+        }
+
+        #name-overlay input {
+            font-size: 18px;
+            padding: 10px 14px;
+            border-radius: 6px;
+            border: 1px solid #444;
+            width: 260px;
+        }
+
+        #name-overlay button {
+            font-size: 16px;
+            padding: 10px 20px;
+            border-radius: 6px;
+            border: none;
+            background: #3388ff;
+            color: white;
+            cursor: pointer;
+        }
+
+        #name-overlay button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+    </style>
+
+    <body>
+        <!-- Asked before anything else loads: EHS tags need to know who left
+             each note. A normal HTML input also means the Quest's OS keyboard
+             pops up (not our in-VR one), which is much less painful to type on. -->
+        <div id="name-overlay">
+            <div>Ingresá tu nombre para comenzar</div>
+            <input id="name-input" type="text" placeholder="Nombre y apellido" maxlength="40" autofocus />
+            <button id="name-submit" disabled>Continuar</button>
+        </div>
+
+        <script type="importmap">
+            {
+                "imports": {
+                    "three": "./engine/three/three.module.js",
+                    "three/addons/": "./engine/three/jsm/"
+                }
+            }
+        </script>
+        <script type="module">
+            import * as THREE from 'three';
+            import { VRButton } from 'three/addons/webxr/VRButton.js';
+            import { LCCRender } from './sdk/lcc-sdk-three.js';
+            import { XRLocomotion } from './engine/three/XRLocomotion.js';
+            import { MultiplayerSession } from './engine/three/Multiplayer.js';
+            import { VRKeyboard } from './engine/three/VRKeyboard.js';
+
+            // ==================== Configuration ====================
+
+            /** Set to true to show FPS / performance stats overlay and VR HUD */
+            const ENABLE_STATS = true;
+
+            // Fill this in once the server from /server is deployed, e.g.
+            // 'wss://your-app.onrender.com'. Multiplayer/tags stay disabled until set.
+            const MULTIPLAYER_SERVER_URL = '';
+            const MULTIPLAYER_ROOM = 'edificio-baron';
+
+            // ==================== Name gate ====================
+            // Everything else waits for this so createTag() always has a real
+            // author name instead of an anonymous UUID.
+            const nameOverlay = document.getElementById('name-overlay');
+            const nameInput = document.getElementById('name-input');
+            const nameSubmit = document.getElementById('name-submit');
+
+            nameInput.addEventListener('input', () => {
+                nameSubmit.disabled = nameInput.value.trim().length === 0;
+            });
+            nameInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && nameInput.value.trim().length > 0) nameSubmit.click();
+            });
+
+            const playerName = await new Promise((resolve) => {
+                nameSubmit.addEventListener('click', () => {
+                    const value = nameInput.value.trim();
+                    if (!value) return;
+                    nameOverlay.remove();
+                    resolve(value);
+                });
+            });
+
+            // ==================== Init ====================
+
+            let isVRDevice = false;
+            try {
+                if (navigator.xr) {
+                    isVRDevice = await navigator.xr.isSessionSupported('immersive-vr');
+                }
+            } catch (e) {
+                console.warn('[XR] VR support check failed:', e);
+            }
+            console.warn('isVRDevice: ', isVRDevice);
+
+            // Extract data path from URL ?data=xxx, fallback to default path
+            const dataParam = new URLSearchParams(location.search).get('data');
+            const dataPath = dataParam || `${location.origin}/assets/caixin_lcc2/meta.lcc2`;
+
+            const scene = new THREE.Scene();
+
+            const renderer = new THREE.WebGLRenderer();
+            // NOTE: do NOT set logarithmicDepthBuffer: true here. This SDK's splats
+            // render through custom shaders (see the LCC_DEPTH define toggled via
+            // setLccDepth) that most likely don't include three.js's log-depth shader
+            // chunks — enabling it mismatches the depth math and can render as a
+            // black screen. If depth-precision flicker comes back, address it via
+            // near/far range instead, not this flag.
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+
+            if (isVRDevice) {
+                renderer.xr.enabled = true;
+                renderer.xr.setReferenceSpaceType('local-floor');
+                renderer.xr.setFoveation(1);
+                renderer.xr.setFramebufferScaleFactor(0.6);
+            }
+
+            renderer.setClearColor(0x000000);
+            document.body.appendChild(renderer.domElement);
+            if (isVRDevice) {
+                document.body.appendChild(VRButton.createButton(renderer));
+            }
+
+            const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 150000);
+            camera.position.set(0, 2, 0);
+
+            // ==================== XR Locomotion ====================
+            // AVP: pinch select to move continuously along gaze direction
+            // For Quest/Pico thumbstick mode, change device to 'quest' or 'pico'
+            let locomotion = null;
+            if (isVRDevice) {
+                locomotion = new XRLocomotion(renderer, camera, scene, {
+                    device: 'quest',
+                    moveSpeed: 2,
+                    teleport: false,
+                    fixedHeight: true
+                });
+            } else {
+                // Non-VR: camera added directly to scene
+                scene.add(camera);
+            }
+            // ==================== End Locomotion ====================
+
+            // lccObj is assigned further down (after LCCRender.load), but the
+            // controller listeners below need to call lccObj.raycastFromOrigin —
+            // declared early so the closures can see it once it's ready.
+            let lccObj = null;
+
+            // ==================== Multiplayer + EHS Tags ====================
+            let controllerL = null;
+            let controllerR = null;
+            let multiplayer = null;
+            const keyboard = new VRKeyboard();
+            keyboard.mesh.material.side = THREE.DoubleSide; // visible/raycastable from either side, avoids facing-direction guesswork
+            scene.add(keyboard.mesh);
+            const _keyboardRaycaster = new THREE.Raycaster();
+
+            // How the SDK's precision raycast behaves — see lcc-sdk-three.js's
+            // lccObj.raycastFromOrigin(). radius is the splat "hit thickness" in
+            // meters; opacityThreshold skips near-transparent splats.
+            const TAG_RAYCAST_MAX_DISTANCE = 50;
+            const TAG_RAYCAST_RADIUS = 0.03;
+            const TAG_RAYCAST_OPACITY_THRESHOLD = 0.3;
+
+            if (isVRDevice) {
+                const c0 = renderer.xr.getController(0);
+                const c1 = renderer.xr.getController(1);
+                const assignHand = (controller) => (event) => {
+                    if (event.data.handedness === 'left') controllerL = controller;
+                    else if (event.data.handedness === 'right') controllerR = controller;
+                };
+                c0.addEventListener('connected', assignHand(c0));
+                c1.addEventListener('connected', assignHand(c1));
+
+                if (MULTIPLAYER_SERVER_URL) {
+                    multiplayer = new MultiplayerSession(scene, {
+                        serverUrl: MULTIPLAYER_SERVER_URL,
+                        room: MULTIPLAYER_ROOM,
+                        playerName
+                    });
+                    multiplayer.connect();
+                } else {
+                    console.warn('[Multiplayer] MULTIPLAYER_SERVER_URL is empty — multiplayer/tags disabled.');
+                }
+
+                const controllerOrigin = new THREE.Vector3();
+                const controllerDir = new THREE.Vector3();
+                const _rotMat = new THREE.Matrix4();
+
+                const readControllerRay = (controller) => {
+                    controllerOrigin.setFromMatrixPosition(controller.matrixWorld);
+                    controllerDir
+                        .set(0, 0, -1)
+                        .applyMatrix4(_rotMat.extractRotation(controller.matrixWorld))
+                        .normalize();
+                };
+
+                // Right controller squeeze (grip) = raycast against the actual splat
+                // surface the controller is pointing at (lccObj.raycastFromOrigin —
+                // real geometry, not a guessed fixed distance) and open the keyboard
+                // right there to type an EHS note for that exact spot.
+                const openKeyboardFor = (controller) => () => {
+                    if (!multiplayer || keyboard.isOpen || controller !== controllerR) return;
+                    if (!lccObj) {
+                        console.warn('[Tags] model not loaded yet, cannot place a tag.');
+                        return;
+                    }
+                    readControllerRay(controller);
+                    const hit = lccObj.raycastFromOrigin({
+                        origin: { x: controllerOrigin.x, y: controllerOrigin.y, z: controllerOrigin.z },
+                        direction: { x: controllerDir.x, y: controllerDir.y, z: controllerDir.z },
+                        maxDistance: TAG_RAYCAST_MAX_DISTANCE,
+                        radius: TAG_RAYCAST_RADIUS,
+                        opacityThreshold: TAG_RAYCAST_OPACITY_THRESHOLD
+                    });
+
+                    // No hit (pointing at empty space/sky) — don't place a tag on a
+                    // guess; the user can just re-aim and squeeze again.
+                    if (!hit) return;
+                    const tagPos = new THREE.Vector3(hit.x, hit.y, hit.z);
+
+                    // Position the keyboard a bit toward the camera from the tag point
+                    // (so it doesn't clip into the model surface) and face it at the
+                    // player, not at whatever odd angle the controller was aimed.
+                    const camPos = camera.getWorldPosition(new THREE.Vector3());
+                    const towardCam = camPos.clone().sub(tagPos).normalize();
+                    const keyboardPos = tagPos.clone().addScaledVector(towardCam, 0.25);
+                    const keyboardOrient = new THREE.Object3D();
+                    keyboardOrient.position.copy(keyboardPos);
+                    keyboardOrient.lookAt(camPos);
+
+                    keyboard.open(keyboardPos, keyboardOrient.quaternion);
+                    keyboard.onSubmit = (text) => {
+                        if (text.trim().length > 0) multiplayer.createTag(tagPos, text.trim());
+                    };
+                };
+
+                // Right controller trigger = "click" whatever key it's pointing at,
+                // ONLY while the keyboard is open (otherwise the trigger belongs to
+                // locomotion — see XRLocomotion, left-hand fly only).
+                const typeKeyFor = (controller) => () => {
+                    if (!keyboard.isOpen || controller !== controllerR) return;
+                    readControllerRay(controller);
+                    _keyboardRaycaster.set(controllerOrigin, controllerDir);
+                    const hit = _keyboardRaycaster.intersectObject(keyboard.mesh)[0];
+                    if (hit && hit.uv) keyboard.handleSelect(hit.uv);
+                };
+
+                c0.addEventListener('squeezestart', openKeyboardFor(c0));
+                c1.addEventListener('squeezestart', openKeyboardFor(c1));
+                c0.addEventListener('selectstart', typeKeyFor(c0));
+                c1.addEventListener('selectstart', typeKeyFor(c1));
+            }
+            // ==================== End Multiplayer + EHS Tags ====================
+
+            // ==================== Stats Panel ====================
+            let statsPanel = null;
+            if (ENABLE_STATS) {
+                const { StatsPanel } = await import('./engine/three/StatsPanel.js');
+                statsPanel = new StatsPanel(THREE, renderer, { xrHud: isVRDevice });
+                if (statsPanel.xrHudObject) {
+                    scene.add(statsPanel.xrHudObject);
+                }
+            }
+            // ==================== End Stats ====================
+
+            // Use the model matrix to change the model coordinate system
+            const modelMatrix = new THREE.Matrix4(-1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1);
+
+            // Loading lcc object
+            lccObj = LCCRender.load(
+                {
+                    camera: camera,
+                    scene: scene,
+                    dataPath: dataPath,
+                    renderLib: THREE,
+                    canvas: renderer.domElement,
+                    renderer: renderer,
+                    useEnv: true,
+                    usePage: true,
+                    useIndexDB: true,
+                    useLoadingEffect: true,
+                    modelMatrix: modelMatrix,
+                    appKey: null
+                },
+                (mesh) => {
+                    console.log('Lcc object Loaded:  ', mesh);
+                },
+                (percent) => {
+                    console.log('Lcc object loading: ' + (percent * 100).toFixed(1) + '%');
+                },
+                () => {
+                    console.log('Lcc object loading failure');
+                }
+            );
+
+            // Configure performance parameters
+            // Reverted to the exact config that was confirmed working at 56fps.
+            // setLodAutoLevelUp(true) and the raised ceilings (600k/250k/75) are OUT
+            // for now — that's the untested change that lines up with the black
+            // screen. Once this baseline is confirmed working again, reintroduce
+            // ONE change at a time (starting with setLodAutoLevelUp alone) so we
+            // actually know which one is responsible instead of guessing.
+            lccObj.setStartLod(1);
+            lccObj.setMaxSplats(300000);
+            lccObj.setMaxNodeSplats(150000);
+            lccObj.setMaxDistance(60);
+
+            window.lccObj = lccObj;
+            window.LCCRender = LCCRender;
+            window.locomotion = locomotion; // debug: locomotion.getRig().position.set(x,y,z)
+
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+
+            function animate() {
+                renderer.setAnimationLoop((time, frame) => {
+                    // Pause movement while typing an EHS note so the left-trigger fly
+                    // doesn't carry you away mid-sentence.
+                    if (locomotion && !keyboard.isOpen) locomotion.update(time, frame);
+                    if (multiplayer && controllerL && controllerR) {
+                        multiplayer.update(camera, controllerL, controllerR);
+                    }
+                    LCCRender.update();
+                    renderer.render(scene, camera);
+
+                    // Update stats overlay
+                    if (statsPanel) {
+                        statsPanel.update();
+                    }
+                });
+            }
+
+            animate();
+        </script>
+    </body>
+</html>
